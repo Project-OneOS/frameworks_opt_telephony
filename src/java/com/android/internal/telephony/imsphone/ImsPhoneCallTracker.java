@@ -515,6 +515,11 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
      */
     private Map<Pair<Integer, String>, Integer> mImsReasonCodeMap = new ArrayMap<>();
 
+     /**
+     * Carrier configuration option which indicates whether the carrier supports the hold
+     * command while in an IMS call
+     */
+    private boolean mAllowHoldingCall = true;
 
     /**
      * TODO: Remove this code; it is a workaround.
@@ -978,6 +983,23 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
     }
 
     /**
+     * Determines if the device will respect the value of the
+     * {@link CarrierConfigManager#KEY_ALLOW_HOLD_IN_IMS_CALL_BOOL} configuration option.
+     *
+     * @return {@code false} if the device always supports holding IMS calls, {@code true} if it
+     *      will use {@link CarrierConfigManager#KEY_ALLOW_HOLD_IN_IMS_CALL_BOOL} to determine if
+     *      hold is supported.
+     */
+    private boolean doesDeviceRespectHoldCarrierConfig() {
+        Phone phone = getPhone();
+        if (phone == null) {
+            return true;
+        }
+        return phone.getContext().getResources().getBoolean(
+                com.android.internal.R.bool.config_device_respects_hold_carrier_config);
+    }
+
+    /**
      * Caches frequently used carrier configuration items locally.
      *
      * @param subId The sub id.
@@ -1045,6 +1067,8 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                 CarrierConfigManager.KEY_AUTO_RETRY_FAILED_WIFI_EMERGENCY_CALL);
         mIgnoreResetUtCapability =  carrierConfig.getBoolean(
                 CarrierConfigManager.KEY_IGNORE_RESET_UT_CAPABILITY_BOOL);
+        mAllowHoldingCall = carrierConfig.getBoolean(
+                CarrierConfigManager.KEY_ALLOW_HOLD_IN_IMS_CALL_BOOL);
 
         String[] mappings = carrierConfig
                 .getStringArray(CarrierConfigManager.KEY_IMS_REASONINFO_MAPPING_STRING_ARRAY);
@@ -1142,6 +1166,8 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                 setEmergencyCallInfo(profile, conn);
             }
 
+            boolean isStartRttCall = true;
+
             // Translate call subject intent-extra from Telecom-specific extra key to the
             // ImsCallProfile key.
             if (intentExtras != null) {
@@ -1152,7 +1178,10 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                     );
                 }
 
-                if (conn.hasRttTextStream()) {
+                isStartRttCall = intentExtras.getBoolean(
+                    android.telecom.TelecomManager.EXTRA_START_CALL_WITH_RTT, true);
+                if (DBG) log("dialInternal: isStartRttCall = " + isStartRttCall);
+                if (conn.hasRttTextStream() && isStartRttCall) {
                     profile.mMediaProfile.mRttMode = ImsStreamMediaProfile.RTT_MODE_FULL;
                 }
 
@@ -1174,17 +1203,10 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                 // being sent to the lower layers/to the network.
             }
 
-            int mode = QtiImsUtils.getRttOperatingMode(mPhone.getContext());
+            int mode = QtiImsUtils.getRttOperatingMode(mPhone.getContext(), mPhone.getPhoneId());
             if (DBG) log("RTT: setRttModeBasedOnOperator mode = " + mode);
 
             if (mPhone.isRttSupported() && mPhone.isRttOn()) {
-                boolean isStartRttCall = true;
-                if (intentExtras != null) {
-                    isStartRttCall = intentExtras.getBoolean(
-                            android.telecom.TelecomManager.EXTRA_START_CALL_WITH_RTT, true);
-
-                }
-                if (DBG) log("dialInternal: isStartRttCall = " + isStartRttCall);
                 if (isStartRttCall &&
                         (!profile.isVideoCall() || QtiImsUtils.isRttSupportedOnVtCalls(
                         mPhone.getPhoneId(),mPhone.getContext()))) {
@@ -1326,6 +1348,7 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                     ImsCommand.IMS_CMD_HOLD);
         } catch (ImsException e) {
             mForegroundCall.switchWith(mBackgroundCall);
+            mHoldSwitchingState = HoldSwapState.INACTIVE;
             throw new CallStateException(e.getMessage());
         }
     }
@@ -1355,6 +1378,7 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                         ImsCommand.IMS_CMD_HOLD);
             } catch (ImsException e) {
                 mForegroundCall.switchWith(mBackgroundCall);
+                mHoldSwitchingState = HoldSwapState.INACTIVE;
                 throw new CallStateException(e.getMessage());
             }
         }
@@ -1377,6 +1401,7 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                         ImsCommand.IMS_CMD_HOLD);
             } catch (ImsException e) {
                 mForegroundCall.switchWith(mBackgroundCall);
+                mHoldSwitchingState = HoldSwapState.INACTIVE;
                 throw new CallStateException(e.getMessage());
             }
         }
@@ -1403,6 +1428,8 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                         ImsCommand.IMS_CMD_RESUME);
             }
         } catch (ImsException e) {
+            mForegroundCall.switchWith(mBackgroundCall);
+            mHoldSwitchingState = HoldSwapState.INACTIVE;
             throw new CallStateException(e.getMessage());
         }
     }
@@ -2133,8 +2160,6 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
 
         int code = maybeRemapReasonCode(reasonInfo);
         switch (code) {
-            case ImsReasonInfo.CODE_SIP_REQUEST_CANCELLED:
-                return DisconnectCause.OUTGOING_FAILURE;
             case ImsReasonInfo.CODE_SIP_ALTERNATE_EMERGENCY_CALL:
                 return DisconnectCause.IMS_SIP_ALTERNATE_EMERGENCY_CALL;
             case ImsReasonInfo.CODE_SIP_BAD_ADDRESS:
@@ -2534,21 +2559,39 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                 // If we are the in midst of swapping FG and BG calls and the call that was
                 // terminated was the one that we expected to resume, we need to swap the FG and
                 // BG calls back.
-                if (imsCall == mCallExpectedToResume) {
-                    if (DBG) {
-                        log("onCallTerminated: switching " + mForegroundCall + " with "
-                                + mBackgroundCall);
-                    }
-                    mForegroundCall.switchWith(mBackgroundCall);
-                }
-                // This call terminated in the midst of a switch after the other call was held, so
-                // resume it back to ACTIVE state since the switch failed.
-                log("onCallTerminated: foreground call in state " + mForegroundCall.getState() +
-                        " and ringing call in state " + (mRingingCall == null ? "null" :
+                log("onCallTerminated: foreground call in state : " + mForegroundCall.getState() +
+                        " , background call in state : " + mBackgroundCall.getState() +
+                        " and ringing call in state : " + (mRingingCall == null ? "null" :
                         mRingingCall.getState().toString()));
-
-                sendEmptyMessage(EVENT_RESUME_NOW_FOREGROUND_CALL);
-                mHoldSwitchingState = HoldSwapState.INACTIVE;
+                if (imsCall == mCallExpectedToResume) {
+                    if (!mBackgroundCall.getImsCall().isPendingHold()) {
+                        //Switch the calls only if the background call is not in a PENDING_HOLD
+                        //state. Otherwise resuming the background call will anyways fail
+                        //and we would have incorrectly switched the calls. The user won't be able
+                        //to resume the held call later on.
+                        if (DBG) {
+                            log("onCallTerminated: switching " + mForegroundCall + " with "
+                                    + mBackgroundCall);
+                        }
+                        // This call terminated in the midst of a switch after the other call was
+                        // held, so resume it back to ACTIVE state since the switch failed.
+                        mForegroundCall.switchWith(mBackgroundCall);
+                        sendEmptyMessage(EVENT_RESUME_NOW_FOREGROUND_CALL);
+                        mHoldSwitchingState = HoldSwapState.INACTIVE;
+                    } else {
+                        log("onCallTerminated: backgroung call has a PENDING_HOLD action in " +
+                                "progress and cannot be resumed. Avoid switching the fg and bg "+
+                                "calls and dont send EVENT_RESUME_NOW_FOREGROUND_CALL");
+                        //Since the foreground call has ended and the background call
+                        //is in PENDING_HOLD state
+                        mHoldSwitchingState = HoldSwapState.PENDING_SINGLE_CALL_HOLD;
+                    }
+                } else {
+                    // The call which was put on hold and not expected to resume got terminated.
+                    // Just resume the foreground call as is done currently.
+                    sendEmptyMessage(EVENT_RESUME_NOW_FOREGROUND_CALL);
+                    mHoldSwitchingState = HoldSwapState.INACTIVE;
+                }
                 mCallExpectedToResume = null;
                 logHoldSwapState("onCallTerminated swap active and hold case");
             } else if (mHoldSwitchingState == HoldSwapState.PENDING_SINGLE_CALL_UNHOLD
@@ -2625,6 +2668,17 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                         dialPendingMO();
                         mHoldSwitchingState = HoldSwapState.INACTIVE;
                         logHoldSwapState("onCallHeld hold to dial");
+                    }  else if (mHoldSwitchingState == HoldSwapState.PENDING_SINGLE_CALL_HOLD
+                            && doesDeviceRespectHoldCarrierConfig() && !mAllowHoldingCall) {
+                        // In this case since holding/unholding call is not allowed from UI we are
+                        // resuming the call which is currently in background.
+                        // The current fix assumes that holdActiveCall() which also sets
+                        // mHoldSwitchingState to HoldSwapState.PENDING_SINGLE_CALL_HOLD
+                        // will only be called from UI and not from framework.
+                        mForegroundCall.switchWith(mBackgroundCall);
+                        sendEmptyMessage(EVENT_RESUME_NOW_FOREGROUND_CALL);
+                        mHoldSwitchingState = HoldSwapState.INACTIVE;
+                        logHoldSwapState("onCallHeld auto resume");
                     } else {
                         // In this case there will be no call resumed, so we can assume that we
                         // are done switching fg and bg calls now.
@@ -2847,8 +2901,8 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
             }
             foregroundImsPhoneCall.merge(peerImsPhoneCall, ImsPhoneCall.State.ACTIVE);
 
+            final ImsPhoneConnection conn = findConnection(call);
             try {
-                final ImsPhoneConnection conn = findConnection(call);
                 log("onCallMerged: ImsPhoneConnection=" + conn);
                 log("onCallMerged: CurrentVideoProvider=" + conn.getVideoProvider());
                 setVideoCallProvider(conn, call);
@@ -2864,6 +2918,10 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
             if (peerConnection != null) {
                 processCallStateChange(mBackgroundCall.getImsCall(), ImsPhoneCall.State.HOLDING,
                     DisconnectCause.NOT_DISCONNECTED);
+            }
+
+            if (conn != null) {
+                conn.handleMergeComplete();
             }
 
             // Check if the merge was requested by an existing conference call. In that
