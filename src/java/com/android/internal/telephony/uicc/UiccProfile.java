@@ -98,6 +98,7 @@ public class UiccProfile extends IccCard {
     private int mGsmUmtsSubscriptionAppIndex;
     private int mCdmaSubscriptionAppIndex;
     private int mImsSubscriptionAppIndex;
+    private int mApplicationCount;
     private UiccCardApplication[] mUiccApplications =
             new UiccCardApplication[IccCardStatus.CARD_MAX_APPS];
     private Context mContext;
@@ -137,6 +138,11 @@ public class UiccProfile extends IccCard {
     private UiccCardApplication mUiccApplication = null;
     private IccRecords mIccRecords = null;
     private IccCardConstants.State mExternalState = IccCardConstants.State.UNKNOWN;
+
+    // The number of UiccApplications modem reported. It's different from mUiccApplications.length
+    // which is always CARD_MAX_APPS, and only updated when modem sends an update, and NOT updated
+    // during SIM refresh. It's currently only used to help identify empty profile.
+    private int mLastReportedNumOfUiccApplications;
 
     private final ContentObserver mProvisionCompleteContentObserver =
             new ContentObserver(new Handler()) {
@@ -842,10 +848,11 @@ public class UiccProfile extends IccCard {
     public boolean isEmptyProfile() {
         // If there's no UiccCardApplication, it's an empty profile.
         // Empty profile is a valid case of eSIM (default boot profile).
-        for (UiccCardApplication app : mUiccApplications) {
-            if (app != null) return false;
-        }
-        return true;
+        // But we clear all apps of mUiccCardApplication to be null during refresh (see
+        // resetAppWithAid) but not mLastReportedNumOfUiccApplications.
+        // So if mLastReportedNumOfUiccApplications == 0, it means modem confirmed that we landed
+        // on empty profile.
+        return mLastReportedNumOfUiccApplications == 0;
     }
 
     @Override
@@ -935,6 +942,7 @@ public class UiccProfile extends IccCard {
             mGsmUmtsSubscriptionAppIndex = ics.mGsmUmtsSubscriptionAppIndex;
             mCdmaSubscriptionAppIndex = ics.mCdmaSubscriptionAppIndex;
             mImsSubscriptionAppIndex = ics.mImsSubscriptionAppIndex;
+            mApplicationCount = ics.mApplications.length;
             mContext = c;
             mCi = ci;
             mTelephonyManager = (TelephonyManager) mContext.getSystemService(
@@ -942,6 +950,8 @@ public class UiccProfile extends IccCard {
 
             //update applications
             if (DBG) log(ics.mApplications.length + " applications");
+            mLastReportedNumOfUiccApplications = ics.mApplications.length;
+
             for (int i = 0; i < mUiccApplications.length; i++) {
                 if (mUiccApplications[i] == null) {
                     //Create newly added Applications
@@ -1484,13 +1494,9 @@ public class UiccProfile extends IccCard {
      * Returns number of applications on this card
      */
     public int getNumApplications() {
-        int count = 0;
-        for (UiccCardApplication a : mUiccApplications) {
-            if (a != null) {
-                count++;
-            }
+        synchronized (mLock) {
+            return mApplicationCount;
         }
-        return count;
     }
 
     /**
